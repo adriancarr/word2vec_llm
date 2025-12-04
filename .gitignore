@@ -1,0 +1,6 @@
+venv/
+output/
+__pycache__/
+*.pyc
+.DS_Store
+google-10000-english.txt

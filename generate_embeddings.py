@@ -1,4 +1,3 @@
-```python
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
@@ -76,6 +75,24 @@ def pool_embeddings(token_embeddings, pooling_method, input_ids=None, token_freq
         
         # Weighted mean
         word_embedding = torch.sum(token_embeddings * weights, dim=0)
+        return word_embedding
+
+    elif pooling_method == 'rarest':
+        if token_freqs is None or input_ids is None:
+            raise ValueError("Rarest pooling requires token_freqs and input_ids")
+            
+        # Find index of token with minimum frequency
+        min_freq = float('inf')
+        min_idx = 0
+        
+        for i, tid in enumerate(input_ids):
+            freq = token_freqs.get(tid, float('inf')) # Default to inf if not found
+            if freq < min_freq:
+                min_freq = freq
+                min_idx = i
+                
+        # Select embedding of the rarest token
+        word_embedding = token_embeddings[min_idx]
         return word_embedding
         
     else:
@@ -158,7 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("--input-file", type=str, default="google-10000-english.txt", help="Path to input text file with words")
     parser.add_argument("--output-dir", type=str, default="output", help="Directory to save output files")
     parser.add_argument("--token-frequencies", type=str, help="Path to token frequencies CSV for weighted pooling")
-    parser.add_argument("--pooling", type=str, default="mean", choices=["max", "mean", "weighted"], help="Pooling method to use")
+    parser.add_argument("--pooling", type=str, default="mean", choices=["max", "mean", "weighted", "rarest"], help="Pooling method to use")
     
     args = parser.parse_args()
 
@@ -170,8 +187,8 @@ if __name__ == "__main__":
         # Create a dictionary mapping token_id to count
         token_freqs = dict(zip(df['token_id'], df['count']))
         
-    if args.pooling == 'weighted' and token_freqs is None:
-        print("Error: --token-frequencies is required for weighted pooling.")
+    if args.pooling in ['weighted', 'rarest'] and token_freqs is None:
+        print(f"Error: --token-frequencies is required for {args.pooling} pooling.")
         sys.exit(1)
 
     tokenizer, model = load_model(device)
@@ -193,4 +210,4 @@ if __name__ == "__main__":
             embedding = get_word_embedding(word, tokenizer, model, args.pooling, token_freqs)
             print(f"Embedding shape: {embedding.shape}")
             print(f"First 10 values: {embedding[:10]}")
-```
+

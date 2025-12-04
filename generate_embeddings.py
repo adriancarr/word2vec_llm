@@ -30,7 +30,7 @@ def load_model():
             
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
-            torch_dtype=torch.float16, # Use float16 for efficiency
+            dtype=torch.float16, # Use float16 for efficiency
             device_map="auto" if device.type != "mps" else None # MPS sometimes has issues with device_map="auto"
         )
         if device.type == "mps":
@@ -60,9 +60,8 @@ def get_word_embedding(word, tokenizer, model):
     # Shape: (sequence_length, hidden_size)
     token_embeddings = last_hidden_state[0]
     
-    # Max pool across the sequence length dimension (tokens)
-    # Shape: (hidden_size,)
-    word_embedding, _ = torch.max(token_embeddings, dim=0)
+    # Mean pooling: average across the token dimension (dim=0)
+    word_embedding = torch.mean(token_embeddings, dim=0)
     
     return word_embedding.cpu().numpy()
 

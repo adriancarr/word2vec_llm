@@ -45,8 +45,12 @@ def generate_layer_gallery():
     images = []
     
     # Iterate through layers
-    # Assuming 23 layers (0-22)
-    for layer_idx in range(23):
+    # Detect number of layers
+    layer_files = [f for f in os.listdir(layers_dir) if f.startswith("layer_") and f.endswith(".npy")]
+    num_layers = len(layer_files)
+    print(f"Found {num_layers} layers in {layers_dir}")
+    
+    for layer_idx in range(num_layers):
         print(f"\nProcessing Layer {layer_idx}...")
         
         tsne_path = os.path.join(tsne_dir, f"tsne_layer_{layer_idx:02d}.csv")

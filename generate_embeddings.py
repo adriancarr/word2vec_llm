@@ -62,25 +62,25 @@ class WordEmbeddingGenerator:
             logger.info("Using CPU.")
             return torch.device("cpu")
 
-    def _load_model(self) -> Tuple[PreTrainedTokenizer, PreTrainedModel]:
-        logger.info(f"Loading model: {self.MODEL_NAME}...")
+    def _load_model(self):
+        model_id = "Qwen/Qwen2.5-1.5B"
+        logger.info(f"Loading model: {model_id}...")
+        
         try:
-            tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME)
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id, 
+                device_map=self.device, 
+                torch_dtype=torch.float16 if self.device.type != "cpu" else torch.float32,
+                trust_remote_code=True
+            )
+            
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
-            
-            model = AutoModelForCausalLM.from_pretrained(
-                self.MODEL_NAME,
-                dtype=torch.float16,
-                device_map="auto" if self.device.type != "mps" else None
-            )
-            if self.device.type == "mps":
-                model.to(self.device)
-            
-            model.eval()
+                
             return tokenizer, model
         except Exception as e:
-            logger.error(f"Error loading model: {e}")
+            logger.error(f"Failed to load model: {e}")
             raise
 
     def _load_token_freqs(self, path: str) -> Dict[int, int]:

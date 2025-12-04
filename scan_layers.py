@@ -110,7 +110,8 @@ def scan_layers():
     all_layers_data, _ = generator.generate_all_layers(
         words, 
         pooling_method='rarest', 
-        batch_size=64
+        batch_size=64,
+        save_layers_dir="output/layers"
     )
     
     for layer_idx in range(num_layers + 1):

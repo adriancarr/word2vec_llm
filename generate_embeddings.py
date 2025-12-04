@@ -1,213 +1,288 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer, PreTrainedModel
 import numpy as np
 import argparse
-import sys
 import json
-from tqdm import tqdm
+import logging
 import os
 import pandas as pd
+from typing import List, Dict, Optional, Union, Tuple
+from tqdm import tqdm
+from torch.utils.data import DataLoader, Dataset
 
-# Check for MPS device
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-    print("MPS (Metal Performance Shaders) is available.")
-elif torch.cuda.is_available():
-    device = torch.device("cuda")
-    print("Using CUDA device.")
-else:
-    device = torch.device("cpu")
-    print("MPS not available. Using CPU.")
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+class WordDataset(Dataset):
+    """Dataset for iterating over a list of words."""
+    def __init__(self, words: List[str]):
+        self.words = words
 
-def load_model(device):
-    print(f"Loading model: {MODEL_NAME}...")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        # Llama models often don't have a pad token, so we set it to eos_token
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-            
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            dtype=torch.float16, # Use float16 for efficiency
-            device_map="auto" if device.type != "mps" else None # MPS sometimes has issues with device_map="auto"
-        )
-        if device.type == "mps":
-            model.to(device)
-            
-        model.eval()
-        return tokenizer, model
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        print("Please ensure you have access to the model and have logged in with 'huggingface-cli login'.")
-        sys.exit(1)
+    def __len__(self):
+        return len(self.words)
 
-def pool_embeddings(token_embeddings, pooling_method, input_ids=None, token_freqs=None, device=None):
+    def __getitem__(self, idx):
+        return self.words[idx]
+
+class WordEmbeddingGenerator:
     """
-    Combines token embeddings into a single word embedding using the specified method.
+    A class to generate word embeddings using a pre-trained LLM.
+    Supports batch processing and multiple pooling strategies.
     """
-    if pooling_method == 'max':
-        # Max pooling: take the max value across the token dimension
-        word_embedding, _ = torch.max(token_embeddings, dim=0)
-        return word_embedding
-        
-    elif pooling_method == 'mean':
-        # Mean pooling: average across the token dimension
-        word_embedding = torch.mean(token_embeddings, dim=0)
-        return word_embedding
-        
-    elif pooling_method == 'weighted':
-        if token_freqs is None or input_ids is None:
-            raise ValueError("Weighted pooling requires token_freqs and input_ids")
-            
-        # Calculate weights: 1 / frequency
-        weights = []
-        for tid in input_ids:
-            freq = token_freqs.get(tid, 1) # Default to 1 if not found (shouldn't happen if freq file is complete)
-            weights.append(1.0 / freq)
-        
-        weights = torch.tensor(weights, device=device).unsqueeze(1) # Shape: (sequence_length, 1)
-        
-        # Normalize weights so they sum to 1
-        weights = weights / weights.sum()
-        
-        # Weighted mean
-        word_embedding = torch.sum(token_embeddings * weights, dim=0)
-        return word_embedding
-
-    elif pooling_method == 'rarest':
-        if token_freqs is None or input_ids is None:
-            raise ValueError("Rarest pooling requires token_freqs and input_ids")
-            
-        # Find index of token with minimum frequency
-        min_freq = float('inf')
-        min_idx = 0
-        
-        for i, tid in enumerate(input_ids):
-            freq = token_freqs.get(tid, float('inf')) # Default to inf if not found
-            if freq < min_freq:
-                min_freq = freq
-                min_idx = i
-                
-        # Select embedding of the rarest token
-        word_embedding = token_embeddings[min_idx]
-        return word_embedding
-        
-    else:
-        raise ValueError(f"Unknown pooling method: {pooling_method}")
-
-def get_word_embedding(word, tokenizer, model, pooling_method='mean', token_freqs=None):
-    """
-    Generates an embedding for a word using the specified pooling method.
-    """
-    # Tokenize the word
-    # add_special_tokens=False because we want the embedding of the word itself, 
-    # not surrounded by BOS/EOS tokens which might dominate the representation
-    inputs = tokenizer(word, return_tensors="pt", add_special_tokens=False).to(device)
     
-    # Get the input_ids to look up frequencies if needed
-    input_ids = inputs['input_ids'][0].cpu().numpy()
+    MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
-    with torch.no_grad():
-        outputs = model(**inputs, output_hidden_states=True)
-    
-        # Get the last hidden state
-        # Shape: (batch_size, sequence_length, hidden_size)
-        last_hidden_state = outputs.hidden_states[-1]
+    def __init__(self, device: Optional[str] = None, token_freqs_path: Optional[str] = None):
+        """
+        Initialize the generator.
         
-        # Remove batch dimension
-        # Shape: (sequence_length, hidden_size)
-        token_embeddings = last_hidden_state[0]
-        
-        word_embedding = pool_embeddings(
-            token_embeddings, 
-            pooling_method, 
-            input_ids=input_ids, 
-            token_freqs=token_freqs, 
-            device=device
-        )
-    
-    return word_embedding.cpu().numpy()
+        Args:
+            device: 'cpu', 'cuda', or 'mps'. If None, auto-detects.
+            token_freqs_path: Path to CSV file containing token frequencies (required for weighted/rarest pooling).
+        """
+        self.device = self._get_device(device)
+        self.tokenizer, self.model = self._load_model()
+        self.token_freqs = self._load_token_freqs(token_freqs_path) if token_freqs_path else None
 
-def process_bulk(input_file, output_dir, tokenizer, model, pooling_method, token_freqs=None):
-    if not os.path.exists(input_file):
-        print(f"Error: Input file '{input_file}' not found.")
-        return
+    def _get_device(self, device_name: Optional[str]) -> torch.device:
+        if device_name:
+            return torch.device(device_name)
+        if torch.backends.mps.is_available():
+            logger.info("MPS (Metal Performance Shaders) is available.")
+            return torch.device("mps")
+        elif torch.cuda.is_available():
+            logger.info("CUDA is available.")
+            return torch.device("cuda")
+        else:
+            logger.info("Using CPU.")
+            return torch.device("cpu")
 
-    print(f"Reading words from {input_file}...")
-    with open(input_file, 'r') as f:
-        words = [line.strip() for line in f if line.strip()]
-
-    print(f"Found {len(words)} words.")
-    
-    embeddings = []
-    processed_words = []
-    
-    print(f"Generating embeddings using {pooling_method} pooling...")
-    for word in tqdm(words):
+    def _load_model(self) -> Tuple[PreTrainedTokenizer, PreTrainedModel]:
+        logger.info(f"Loading model: {self.MODEL_NAME}...")
         try:
-            emb = get_word_embedding(word, tokenizer, model, pooling_method, token_freqs)
-            embeddings.append(emb)
-            processed_words.append(word)
+            tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            
+            model = AutoModelForCausalLM.from_pretrained(
+                self.MODEL_NAME,
+                dtype=torch.float16,
+                device_map="auto" if self.device.type != "mps" else None
+            )
+            if self.device.type == "mps":
+                model.to(self.device)
+            
+            model.eval()
+            return tokenizer, model
         except Exception as e:
-            print(f"Error processing word '{word}': {e}")
+            logger.error(f"Error loading model: {e}")
+            raise
 
-    embeddings_array = np.array(embeddings)
-    
-    # Save results
-    os.makedirs(output_dir, exist_ok=True)
-    npy_path = os.path.join(output_dir, "embeddings.npy")
-    json_path = os.path.join(output_dir, "words.json")
-    
-    np.save(npy_path, embeddings_array)
-    with open(json_path, 'w') as f:
-        json.dump(processed_words, f)
+    def _load_token_freqs(self, path: str) -> Dict[int, int]:
+        logger.info(f"Loading token frequencies from {path}...")
+        try:
+            df = pd.read_csv(path)
+            return dict(zip(df['token_id'], df['count']))
+        except Exception as e:
+            logger.error(f"Error loading token frequencies: {e}")
+            raise
+
+    def pool_embeddings(self, 
+                       token_embeddings: torch.Tensor, 
+                       input_ids: torch.Tensor, 
+                       attention_mask: torch.Tensor, 
+                       pooling_method: str) -> torch.Tensor:
+        """
+        Pools token embeddings into word embeddings.
         
-    print(f"Saved {len(embeddings)} embeddings to {npy_path}")
-    print(f"Saved word list to {json_path}")
+        Args:
+            token_embeddings: (batch_size, seq_len, hidden_size)
+            input_ids: (batch_size, seq_len)
+            attention_mask: (batch_size, seq_len)
+            pooling_method: 'max', 'mean', 'weighted', 'rarest'
+            
+        Returns:
+            (batch_size, hidden_size)
+        """
+        batch_size, seq_len, hidden_size = token_embeddings.shape
+        
+        if pooling_method == 'mean':
+            # Mask padding tokens (set to 0)
+            mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            sum_embeddings = torch.sum(token_embeddings * mask_expanded, dim=1)
+            sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
+            return sum_embeddings / sum_mask
 
-if __name__ == "__main__":
+        elif pooling_method == 'max':
+            # Set padded values to -inf so they don't affect max
+            mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size())
+            token_embeddings[~mask_expanded.bool()] = float('-inf')
+            return torch.max(token_embeddings, dim=1)[0]
+
+        elif pooling_method == 'weighted':
+            if self.token_freqs is None:
+                raise ValueError("Token frequencies required for weighted pooling")
+            
+            # Vectorized weight lookup is tricky with dict, so we loop or map
+            # For simplicity and safety with the dict, we'll iterate
+            # (Optimization: convert dict to tensor array if vocab is contiguous, but simple loop is fine for inference)
+            weights = torch.zeros_like(input_ids, dtype=torch.float, device=self.device)
+            
+            # TODO: Optimize this loop
+            input_ids_cpu = input_ids.cpu().numpy()
+            for b in range(batch_size):
+                for s in range(seq_len):
+                    if attention_mask[b, s]:
+                        tid = input_ids_cpu[b, s]
+                        freq = self.token_freqs.get(tid, 1)
+                        weights[b, s] = 1.0 / freq
+            
+            weights = weights.unsqueeze(-1) # (batch, seq, 1)
+            
+            # Normalize weights per sequence
+            # Mask padding weights
+            weights = weights * attention_mask.unsqueeze(-1)
+            sum_weights = torch.sum(weights, dim=1, keepdim=True)
+            norm_weights = weights / torch.clamp(sum_weights, min=1e-9)
+            
+            return torch.sum(token_embeddings * norm_weights, dim=1)
+
+        elif pooling_method == 'rarest':
+            if self.token_freqs is None:
+                raise ValueError("Token frequencies required for rarest pooling")
+                
+            word_embeddings = []
+            input_ids_cpu = input_ids.cpu().numpy()
+            
+            for b in range(batch_size):
+                min_freq = float('inf')
+                min_idx = 0
+                valid_token_found = False
+                
+                for s in range(seq_len):
+                    if attention_mask[b, s]:
+                        tid = input_ids_cpu[b, s]
+                        freq = self.token_freqs.get(tid, float('inf'))
+                        if freq < min_freq:
+                            min_freq = freq
+                            min_idx = s
+                            valid_token_found = True
+                
+                if valid_token_found:
+                    word_embeddings.append(token_embeddings[b, min_idx])
+                else:
+                    # Should not happen for valid words, but fallback to mean or first
+                    word_embeddings.append(token_embeddings[b, 0])
+            
+            return torch.stack(word_embeddings)
+
+        else:
+            raise ValueError(f"Unknown pooling method: {pooling_method}")
+
+    def generate_embeddings(self, 
+                          words: List[str], 
+                          pooling_method: str = 'mean', 
+                          batch_size: int = 32) -> Tuple[np.ndarray, List[str]]:
+        """
+        Generates embeddings for a list of words using batch processing.
+        """
+        dataset = WordDataset(words)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        
+        all_embeddings = []
+        processed_words = []
+        
+        logger.info(f"Generating embeddings for {len(words)} words using {pooling_method} pooling (batch_size={batch_size})...")
+        
+        with torch.no_grad():
+            for batch_words in tqdm(dataloader):
+                # Tokenize batch
+                # add_special_tokens=False to get pure word representation
+                inputs = self.tokenizer(
+                    batch_words, 
+                    return_tensors="pt", 
+                    padding=True, 
+                    truncation=True, 
+                    max_length=128,
+                    add_special_tokens=False
+                ).to(self.device)
+                
+                outputs = self.model(**inputs, output_hidden_states=True)
+                last_hidden_state = outputs.hidden_states[-1] # (batch, seq, hidden)
+                
+                embeddings = self.pool_embeddings(
+                    last_hidden_state, 
+                    inputs['input_ids'], 
+                    inputs['attention_mask'], 
+                    pooling_method
+                )
+                
+                all_embeddings.append(embeddings.cpu().numpy())
+                processed_words.extend(batch_words)
+                
+        return np.concatenate(all_embeddings, axis=0), processed_words
+
+def main():
     parser = argparse.ArgumentParser(description="Generate word embeddings using TinyLlama 1.1B")
     parser.add_argument("--test-word", type=str, help="Word to test embedding generation for")
     parser.add_argument("--bulk", action="store_true", help="Process a list of words from a file")
-    parser.add_argument("--input-file", type=str, default="google-10000-english.txt", help="Path to input text file with words")
+    parser.add_argument("--input-file", type=str, default="google-10000-english.txt", help="Path to input text file")
     parser.add_argument("--output-dir", type=str, default="output", help="Directory to save output files")
-    parser.add_argument("--token-frequencies", type=str, help="Path to token frequencies CSV for weighted pooling")
-    parser.add_argument("--pooling", type=str, default="mean", choices=["max", "mean", "weighted", "rarest"], help="Pooling method to use")
+    parser.add_argument("--token-frequencies", type=str, help="Path to token frequencies CSV")
+    parser.add_argument("--pooling", type=str, default="mean", choices=["max", "mean", "weighted", "rarest"], help="Pooling method")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for processing")
+    parser.add_argument("--device", type=str, help="Device to use (cpu, cuda, mps)")
     
     args = parser.parse_args()
+    
+    # Validate args
+    if args.pooling in ['weighted', 'rarest'] and not args.token_frequencies:
+        logger.error(f"--token-frequencies is required for {args.pooling} pooling.")
+        return
 
-    # Load token frequencies if provided or needed
-    token_freqs = None
-    if args.token_frequencies:
-        print(f"Loading token frequencies from {args.token_frequencies}...")
-        df = pd.read_csv(args.token_frequencies)
-        # Create a dictionary mapping token_id to count
-        token_freqs = dict(zip(df['token_id'], df['count']))
-        
-    if args.pooling in ['weighted', 'rarest'] and token_freqs is None:
-        print(f"Error: --token-frequencies is required for {args.pooling} pooling.")
-        sys.exit(1)
-
-    tokenizer, model = load_model(device)
+    generator = WordEmbeddingGenerator(device=args.device, token_freqs_path=args.token_frequencies)
 
     if args.test_word:
-        print(f"Generating embedding for '{args.test_word}' using {args.pooling} pooling...")
-        embedding = get_word_embedding(args.test_word, tokenizer, model, args.pooling, token_freqs)
-        print(f"Embedding shape: {embedding.shape}")
-        print(f"First 10 values: {embedding[:10]}")
+        embeddings, _ = generator.generate_embeddings([args.test_word], args.pooling, batch_size=1)
+        print(f"Embedding shape: {embeddings[0].shape}")
+        print(f"First 10 values: {embeddings[0][:10]}")
+        
     elif args.bulk:
-        process_bulk(args.input_file, args.output_dir, tokenizer, model, args.pooling, token_freqs)
+        if not os.path.exists(args.input_file):
+            logger.error(f"Input file '{args.input_file}' not found.")
+            return
+            
+        logger.info(f"Reading words from {args.input_file}...")
+        with open(args.input_file, 'r') as f:
+            words = [line.strip() for line in f if line.strip()]
+            
+        embeddings, processed_words = generator.generate_embeddings(words, args.pooling, args.batch_size)
+        
+        os.makedirs(args.output_dir, exist_ok=True)
+        npy_path = os.path.join(args.output_dir, "embeddings.npy")
+        json_path = os.path.join(args.output_dir, "words.json")
+        
+        np.save(npy_path, embeddings)
+        with open(json_path, 'w') as f:
+            json.dump(processed_words, f)
+            
+        logger.info(f"Saved {len(embeddings)} embeddings to {npy_path}")
+        logger.info(f"Saved word list to {json_path}")
+        
     else:
         # Interactive mode
         while True:
             word = input("Enter a word (or 'q' to quit): ")
             if word.lower() == 'q':
                 break
-            
-            embedding = get_word_embedding(word, tokenizer, model, args.pooling, token_freqs)
-            print(f"Embedding shape: {embedding.shape}")
-            print(f"First 10 values: {embedding[:10]}")
+            embeddings, _ = generator.generate_embeddings([word], args.pooling, batch_size=1)
+            print(f"Embedding shape: {embeddings[0].shape}")
+            print(f"First 10 values: {embeddings[0][:10]}")
 
+if __name__ == "__main__":
+    main()

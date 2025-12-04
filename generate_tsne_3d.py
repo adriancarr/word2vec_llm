@@ -10,9 +10,19 @@ def generate_tsne_3d(embeddings_path, words_path, output_dir):
     print(f"Loading embeddings from {embeddings_path}...")
     embeddings = np.load(embeddings_path)
     
-    print(f"Loading words from {words_path}...")
-    with open(words_path, 'r') as f:
-        words = json.load(f)
+    # Check for tags file
+    tags_path = os.path.join(output_dir, "word_tags.json")
+    if os.path.exists(tags_path):
+        print(f"Loading tags from {tags_path}...")
+        with open(tags_path, 'r') as f:
+            tags_data = json.load(f)
+        words = [item['word'] for item in tags_data]
+        tags = [item['simple_tag'] for item in tags_data]
+    else:
+        print(f"Loading words from {words_path}...")
+        with open(words_path, 'r') as f:
+            words = json.load(f)
+        tags = ['Unknown'] * len(words)
         
     if len(embeddings) != len(words):
         print(f"Error: Number of embeddings ({len(embeddings)}) does not match number of words ({len(words)}).")
@@ -26,6 +36,7 @@ def generate_tsne_3d(embeddings_path, words_path, output_dir):
     # Create DataFrame
     df = pd.DataFrame({
         'word': words,
+        'tag': tags,
         'x': tsne_results[:, 0],
         'y': tsne_results[:, 1],
         'z': tsne_results[:, 2]
@@ -41,8 +52,9 @@ def generate_tsne_3d(embeddings_path, words_path, output_dir):
     print("Generating interactive 3D plot...")
     fig = px.scatter_3d(
         df, x='x', y='y', z='z',
+        color='tag',
         hover_name='word',
-        title='3D t-SNE Visualization of Word Embeddings',
+        title='3D t-SNE Visualization of Word Embeddings (Colored by POS)',
         opacity=0.7,
         size_max=5
     )

@@ -187,7 +187,8 @@ class WordEmbeddingGenerator:
     def generate_embeddings(self, 
                           words: List[str], 
                           pooling_method: str = 'mean', 
-                          batch_size: int = 32) -> Tuple[np.ndarray, List[str]]:
+                          batch_size: int = 32,
+                          layer: int = -1) -> Tuple[np.ndarray, List[str]]:
         """
         Generates embeddings for a list of words using batch processing.
         """
@@ -197,7 +198,7 @@ class WordEmbeddingGenerator:
         all_embeddings = []
         processed_words = []
         
-        logger.info(f"Generating embeddings for {len(words)} words using {pooling_method} pooling (batch_size={batch_size})...")
+        logger.info(f"Generating embeddings for {len(words)} words using {pooling_method} pooling (batch_size={batch_size}, layer={layer})...")
         
         with torch.no_grad():
             for batch_words in tqdm(dataloader):
@@ -213,10 +214,13 @@ class WordEmbeddingGenerator:
                 ).to(self.device)
                 
                 outputs = self.model(**inputs, output_hidden_states=True)
-                last_hidden_state = outputs.hidden_states[-1] # (batch, seq, hidden)
+                # Extract hidden states from the specified layer
+                # outputs.hidden_states is a tuple of (num_layers + 1) tensors
+                # Index -1 is the last layer, 0 is the embedding layer
+                hidden_state = outputs.hidden_states[layer] 
                 
                 embeddings = self.pool_embeddings(
-                    last_hidden_state, 
+                    hidden_state, 
                     inputs['input_ids'], 
                     inputs['attention_mask'], 
                     pooling_method
@@ -226,6 +230,83 @@ class WordEmbeddingGenerator:
                 processed_words.extend(batch_words)
                 
         return np.concatenate(all_embeddings, axis=0), processed_words
+
+    def generate_all_layers(self, 
+                          words: List[str], 
+                          pooling_method: str = 'mean', 
+                          batch_size: int = 32,
+                          save_layers_dir: Optional[str] = None) -> Tuple[Dict[int, np.ndarray], List[str]]:
+        """
+        Generates embeddings for all layers at once.
+        Returns a dict mapping layer_index -> embeddings array.
+        If save_layers_dir is provided, saves each layer to a .npy file.
+        """
+        # Check if all files already exist
+        num_layers = self.model.config.num_hidden_layers
+        if save_layers_dir:
+            os.makedirs(save_layers_dir, exist_ok=True)
+            all_exist = True
+            for i in range(num_layers + 1):
+                if not os.path.exists(os.path.join(save_layers_dir, f"layer_{i:02d}.npy")):
+                    all_exist = False
+                    break
+            
+            if all_exist:
+                logger.info(f"All layer embeddings already exist in {save_layers_dir}. Loading...")
+                final_embeddings = {}
+                processed_words = words # Assuming words match
+                for i in range(num_layers + 1):
+                    final_embeddings[i] = np.load(os.path.join(save_layers_dir, f"layer_{i:02d}.npy"))
+                return final_embeddings, processed_words
+
+        dataset = WordDataset(words)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        
+        # Initialize dict to store list of embeddings for each layer
+        all_layers_embeddings = {i: [] for i in range(num_layers + 1)}
+        processed_words = []
+        
+        logger.info(f"Generating embeddings for all {num_layers+1} layers for {len(words)} words...")
+        
+        with torch.no_grad():
+            for batch_words in tqdm(dataloader):
+                inputs = self.tokenizer(
+                    batch_words, 
+                    return_tensors="pt", 
+                    padding=True, 
+                    truncation=True, 
+                    max_length=128,
+                    add_special_tokens=False
+                ).to(self.device)
+                
+                outputs = self.model(**inputs, output_hidden_states=True)
+                
+                # Process each layer
+                for layer_idx in range(num_layers + 1):
+                    hidden_state = outputs.hidden_states[layer_idx]
+                    
+                    embeddings = self.pool_embeddings(
+                        hidden_state, 
+                        inputs['input_ids'], 
+                        inputs['attention_mask'], 
+                        pooling_method
+                    )
+                    
+                    all_layers_embeddings[layer_idx].append(embeddings.cpu().numpy())
+                
+                processed_words.extend(batch_words)
+        
+        # Concatenate results and save if requested
+        final_embeddings = {}
+        for layer_idx, emb_list in all_layers_embeddings.items():
+            emb_array = np.concatenate(emb_list, axis=0)
+            final_embeddings[layer_idx] = emb_array
+            
+            if save_layers_dir:
+                save_path = os.path.join(save_layers_dir, f"layer_{layer_idx:02d}.npy")
+                np.save(save_path, emb_array)
+            
+        return final_embeddings, processed_words
 
 def main():
     parser = argparse.ArgumentParser(description="Generate word embeddings using TinyLlama 1.1B")
@@ -237,6 +318,8 @@ def main():
     parser.add_argument("--pooling", type=str, default="mean", choices=["max", "mean", "weighted", "rarest"], help="Pooling method")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for processing")
     parser.add_argument("--device", type=str, help="Device to use (cpu, cuda, mps)")
+    parser.add_argument("--layer", type=int, default=-1, help="Layer index to extract embeddings from (default: -1 for last layer)")
+    parser.add_argument("--save-layers-dir", type=str, help="Directory to save embeddings for all layers")
     
     args = parser.parse_args()
     
@@ -261,7 +344,12 @@ def main():
         with open(args.input_file, 'r') as f:
             words = [line.strip() for line in f if line.strip()]
             
-        embeddings, processed_words = generator.generate_embeddings(words, args.pooling, args.batch_size)
+        if args.save_layers_dir:
+            generator.generate_all_layers(words, args.pooling, args.batch_size, args.save_layers_dir)
+            logger.info(f"Saved all layer embeddings to {args.save_layers_dir}")
+            return
+
+        embeddings, processed_words = generator.generate_embeddings(words, args.pooling, args.batch_size, args.layer)
         
         os.makedirs(args.output_dir, exist_ok=True)
         npy_path = os.path.join(args.output_dir, "embeddings.npy")
